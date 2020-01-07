@@ -6,13 +6,24 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-	"os"
 	"strings"
+
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 //Response return type struct
 type Response struct {
 	Images []string
+}
+
+type Info struct {
+	infos []string
+}
+
+type PhotoModel struct {
+	uid         string
+	Image       string
+	createdDate string
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
@@ -56,6 +67,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// var photoArray []PhotoModel
+
 		//copy each part to destination.
 		for {
 			part, err := reader.NextPart()
@@ -68,30 +81,49 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			dst, err := os.Create("/Users/jinseonkim/go/src/hello/storage/" + part.FileName())
-			defer dst.Close()
+			if part.FileName() == "info" {
+				//pasing json here
+				var info Info
+				jsonDecoder := json.NewDecoder(part)
+				err = jsonDecoder.Decode(&info)
+				if err != nil {
+					panic(err)
+				}
+				fmt.Println(info)
+			} else {
+				// dst, err := os.Create("/Users/jinseonkim/go/src/hello/storage/" + part.FileName())
+				// defer dst.Close()
 
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				println("Error occur to save data")
-				return
+				// if err != nil {
+				// 	http.Error(w, err.Error(), http.StatusInternalServerError)
+				// 	println("Error occur to save data")
+				// 	return
+				// }
+
+				// if _, err := io.Copy(dst, part); err != nil {
+				// 	http.Error(w, err.Error(), http.StatusInternalServerError)
+				// 	println("Error occur to copy data")
+				// 	return
+				// }
 			}
 
-			if _, err := io.Copy(dst, part); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				println("Error occur to copy data")
-				return
-			}
 		}
 		//display success message.
-		println("upload", "Upload successful.")
 		fmt.Fprint(w, "success")
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
+var client *mongo.Client
+
 func main() {
+	// ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+	// client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+	// if err != nil {
+	// 	panic(err)
+	// }
+
 	http.HandleFunc("/", uploadHandler)
 
 	//static file handler.

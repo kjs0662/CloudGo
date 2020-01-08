@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
-	"strings"
+	"os"
+	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 //Response return type struct
@@ -17,44 +22,42 @@ type Response struct {
 }
 
 type Info struct {
-	infos []string
+	Identifier  string
+	CreatedDate string
 }
 
 type PhotoModel struct {
-	uid         string
+	Identifier  string
 	Image       string
-	createdDate string
+	CreatedDate string
 }
+
+var client *mongo.Client
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	//GET displays the upload form.
 	case "GET":
-		files, err := ioutil.ReadDir("/Users/jinseonkim/go/src/hello/storage/")
+		ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+		client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
 		if err != nil {
 			panic(err)
 		}
 
-		var fileArray []string
-		for _, file := range files {
-			newfile := "/Users/jinseonkim/go/src/hello/storage/" + file.Name()
-			if err != nil {
-				panic(err)
-			}
-			if strings.HasSuffix(newfile, "png") {
-				fileArray = append(fileArray, newfile)
-			}
-		}
-		fmt.Print(fileArray)
-		response := Response{fileArray}
-		js, err := json.Marshal(response)
+		collection := client.Database("photocloud").Collection("photo")
+		cursor, err := collection.Find(ctx, bson.M{})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			panic(err)
+		}
+		defer cursor.Close(ctx)
+		var photoArray []PhotoModel
+		for cursor.Next(ctx) {
+			var photo PhotoModel
+			cursor.Decode(&photo)
+			photoArray = append(photoArray, photo)
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(js)
+		json.NewEncoder(w).Encode(photoArray)
 
 	//POST takes the uploaded file(s) and saves it to disk.
 	case "POST":
@@ -67,8 +70,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// var photoArray []PhotoModel
-
+		var photoArray []PhotoModel
+		index := 0
 		//copy each part to destination.
 		for {
 			part, err := reader.NextPart()
@@ -76,53 +79,101 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 
-			//if part.FileName() is empty, skip this iteration.
 			if part.FileName() == "" {
-				continue
-			}
-
-			if part.FileName() == "info" {
 				//pasing json here
-				var info Info
-				jsonDecoder := json.NewDecoder(part)
-				err = jsonDecoder.Decode(&info)
-				if err != nil {
-					panic(err)
+
+				buf := new(bytes.Buffer)
+				buf.ReadFrom(part)
+				s := buf.String()
+
+				bytes := []byte(s)
+				var infos []Info
+				json.Unmarshal(bytes, &infos)
+				for l := range infos {
+					photo := PhotoModel{}
+					photo.Identifier = infos[l].Identifier
+					photo.CreatedDate = infos[l].CreatedDate
+					photo.Image = ""
+					photoArray = append(photoArray, photo)
 				}
-				fmt.Println(info)
 			} else {
-				// dst, err := os.Create("/Users/jinseonkim/go/src/hello/storage/" + part.FileName())
-				// defer dst.Close()
+				dst, err := os.Create("/Users/jinseonkim/go/src/hello/storage/" + part.FileName())
+				defer dst.Close()
 
-				// if err != nil {
-				// 	http.Error(w, err.Error(), http.StatusInternalServerError)
-				// 	println("Error occur to save data")
-				// 	return
-				// }
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					println("Error occur to save data")
+					return
+				}
 
-				// if _, err := io.Copy(dst, part); err != nil {
-				// 	http.Error(w, err.Error(), http.StatusInternalServerError)
-				// 	println("Error occur to copy data")
-				// 	return
-				// }
+				if _, err := io.Copy(dst, part); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					println("Error occur to copy data")
+					return
+				}
+				photoArray[index].Image = "/Users/jinseonkim/go/src/hello/storage/" + part.FileName()
+				index++
 			}
+		}
 
+		ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+		client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+		if err != nil {
+			panic(err)
+		}
+
+		collection := client.Database("photocloud").Collection("photo")
+		for i := range photoArray {
+			filter := bson.M{"Identifier": photoArray[i].Identifier}
+			update := bson.M{
+				"$set": bson.M{"Image": photoArray[i].Image, "CreatedDate": photoArray[i].CreatedDate},
+			}
+			upsert := true
+			after := options.After
+			opt := options.FindOneAndUpdateOptions{
+				ReturnDocument: &after,
+				Upsert:         &upsert,
+			}
+			result := collection.FindOneAndUpdate(ctx, filter, update, &opt)
+			if result.Err() != nil {
+				panic(result.Err())
+			}
 		}
 		//display success message.
 		fmt.Fprint(w, "success")
+
+	case "DELETE":
+		respBody, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			panic(err)
+		}
+		str := string(respBody)
+		bytes := []byte(str)
+		var infos []Info
+		json.Unmarshal(bytes, &infos)
+
+		ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+		client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+		if err != nil {
+			panic(err)
+		}
+		collection := client.Database("photocloud").Collection("photo")
+		for i := range infos {
+			filter := bson.M{"Identifier": infos[i].Identifier}
+			opt := options.FindOneAndDeleteOptions{}
+			result := collection.FindOneAndDelete(ctx, filter, &opt)
+			if result.Err() != nil {
+				panic(result.Err())
+			} else {
+
+			}
+		}
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
-var client *mongo.Client
-
 func main() {
-	// ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
-	// client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
-	// if err != nil {
-	// 	panic(err)
-	// }
 
 	http.HandleFunc("/", uploadHandler)
 

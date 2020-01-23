@@ -11,6 +11,11 @@ import (
 	"os"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -24,29 +29,31 @@ type Response struct {
 type Info struct {
 	Identifier  string
 	CreatedDate string
+	Name        string
 }
 
 type PhotoModel struct {
 	Identifier  string
 	Image       string
+	Thumbnail   string
 	CreatedDate string
+	Name        string
 }
-
-var client *mongo.Client
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	//GET displays the upload form.
 	case "GET":
-		ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 		client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
 		if err != nil {
 			panic(err)
 		}
-
-		collection := client.Database("photocloud").Collection("photo")
+		collection := client.Database("cloud").Collection("photo")
 		cursor, err := collection.Find(ctx, bson.M{})
 		if err != nil {
+			fmt.Print("error is here\n")
 			panic(err)
 		}
 		defer cursor.Close(ctx)
@@ -62,6 +69,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	//POST takes the uploaded file(s) and saves it to disk.
 	case "POST":
 		//get the multipart reader for the request.
+
 		reader, err := r.MultipartReader()
 
 		if err != nil {
@@ -69,6 +77,15 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 			println("Error occur to read data")
 			return
 		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+		if err != nil {
+			println("Error occur to connect mongodb")
+			panic(err)
+		}
+		collection := client.Database("cloud").Collection("photo")
 
 		var photoArray []PhotoModel
 		index := 0
@@ -94,10 +111,23 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 					photo.Identifier = infos[l].Identifier
 					photo.CreatedDate = infos[l].CreatedDate
 					photo.Image = ""
+					photo.Thumbnail = ""
+					photo.Name = ""
 					photoArray = append(photoArray, photo)
 				}
 			} else {
-				dst, err := os.Create("/Users/jinseonkim/go/src/hello/storage/" + part.FileName())
+				sess, err := session.NewSession(&aws.Config{
+					Region: aws.String("ap-northeast-1"),
+					Credentials: credentials.NewStaticCredentials(
+						"AKIARI7I35SVOYOCQOYH",
+						"8R/rimRYf1IEhDHHxdupgVw4Q6D3QFmXBlMAc2vR",
+						""),
+				})
+				if err != nil {
+					panic(err)
+				}
+
+				dst, err := os.Create("/home/ec2-user/go/cloud/storage/" + part.FileName())
 				defer dst.Close()
 
 				if err != nil {
@@ -111,34 +141,74 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 					println("Error occur to copy data")
 					return
 				}
-				photoArray[index].Image = "/Users/jinseonkim/go/src/hello/storage/" + part.FileName()
+
+				path := "/home/ec2-user/go/cloud/storage/" + part.FileName()
+				photoArray[index].Name = path
+
+				filter := bson.M{"Identifier": photoArray[index].Identifier}
+				upsert := true
+				after := options.After
+				findOpt := options.FindOneOptions{}
+				findResult := collection.FindOne(ctx, filter, &findOpt)
+				if findResult.Err() != nil {
+					if findResult.Err().Error() == "mongo: no documents in result" {
+
+						// upload image to s3
+						uploader := s3manager.NewUploader(sess)
+						file, err := os.Open(path)
+						defer file.Close()
+						if err != nil {
+							println("Error occur to open tmp local data")
+							panic(err)
+						}
+						result, err := uploader.Upload(&s3manager.UploadInput{
+							Bucket: aws.String("jinseon-photo-bucket"),
+							Key:    aws.String(part.FileName()),
+							Body:   file,
+						})
+						if err != nil {
+							os.Remove(path)
+							println("Error occur to upload data to s3")
+							panic(err)
+						}
+						// make thumbnail image
+
+						os.Remove(path)
+						photoArray[index].Image = result.Location
+					}
+				}
+
+				// save to mongodb
+				var update bson.M
+				if photoArray[index].Image == "" {
+					update = bson.M{
+						"$set": bson.M{
+							"CreatedDate": photoArray[index].CreatedDate,
+							"Identifier":  photoArray[index].Identifier,
+							"Name":        photoArray[index].Name},
+					}
+				} else {
+					update = bson.M{
+						"$set": bson.M{"Image": photoArray[index].Image,
+							"CreatedDate": photoArray[index].CreatedDate,
+							"Identifier":  photoArray[index].Identifier,
+							"Name":        photoArray[index].Name},
+					}
+				}
+				opt := options.FindOneAndUpdateOptions{
+					ReturnDocument: &after,
+					Upsert:         &upsert,
+				}
+				dbResult := collection.FindOneAndUpdate(ctx, filter, update, &opt)
+				if dbResult.Err() != nil {
+					deleteS3(sess, "jinseon-photo-bucket", part.FileName())
+					println("Error occur to update data to mongo")
+					panic(dbResult.Err())
+				}
 				index++
 			}
 		}
 
-		ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
-		client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
-		if err != nil {
-			panic(err)
-		}
-
-		collection := client.Database("photocloud").Collection("photo")
-		for i := range photoArray {
-			filter := bson.M{"Identifier": photoArray[i].Identifier}
-			update := bson.M{
-				"$set": bson.M{"Image": photoArray[i].Image, "CreatedDate": photoArray[i].CreatedDate},
-			}
-			upsert := true
-			after := options.After
-			opt := options.FindOneAndUpdateOptions{
-				ReturnDocument: &after,
-				Upsert:         &upsert,
-			}
-			result := collection.FindOneAndUpdate(ctx, filter, update, &opt)
-			if result.Err() != nil {
-				panic(result.Err())
-			}
-		}
 		//display success message.
 		fmt.Fprint(w, "success")
 
@@ -152,12 +222,23 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		var infos []Info
 		json.Unmarshal(bytes, &infos)
 
-		ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 		client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
 		if err != nil {
 			panic(err)
 		}
-		collection := client.Database("photocloud").Collection("photo")
+		sess, err := session.NewSession(&aws.Config{
+			Region: aws.String("ap-northeast-1"),
+			Credentials: credentials.NewStaticCredentials(
+				"AKIARI7I35SVOYOCQOYH",
+				"8R/rimRYf1IEhDHHxdupgVw4Q6D3QFmXBlMAc2vR",
+				""),
+		})
+		if err != nil {
+			panic(err)
+		}
+		collection := client.Database("cloud").Collection("photo")
 		for i := range infos {
 			filter := bson.M{"Identifier": infos[i].Identifier}
 			opt := options.FindOneAndDeleteOptions{}
@@ -165,12 +246,26 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 			if result.Err() != nil {
 				panic(result.Err())
 			} else {
-
+				deleteS3(sess, "jinseon-photo-bucket", infos[i].Name)
 			}
 		}
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func deleteS3(sess *session.Session, bucket string, obj string) {
+	svc := s3.New(sess)
+	_, err := svc.DeleteObject(&s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(obj)})
+	if err != nil {
+		fmt.Printf("Unable to delete object %q from bucket %q, %v", obj, bucket, err)
+		panic(err)
+	}
+
+	err = svc.WaitUntilObjectNotExists(&s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(obj),
+	})
 }
 
 func main() {

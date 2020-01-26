@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -172,9 +174,41 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 							panic(err)
 						}
 						// make thumbnail image
+						opt := jpeg.Options{
+							Quality: 80,
+						}
+						// change file to image
+						img, _, err := image.Decode(file)
+						// change image to compressed jpeg
+						thumbnailPath := "/home/ec2-user/go/cloud/storage/thumbanil-" + part.FileName()
+						thumbnailFile, err := os.Create(thumbnailPath)
+						err = jpeg.Encode(thumbnailFile, img, &opt)
 
+						if err != nil {
+							println("Error occur to write image file to jpeg")
+							panic(err)
+						}
+						thumbnailFile.Close()
+						tmpFile, err := os.Open(thumbnailPath)
+						defer tmpFile.Close()
+						if err != nil {
+							panic(err)
+						}
+						thumbResult, err := uploader.Upload(&s3manager.UploadInput{
+							Bucket: aws.String("jinseon-thumbnail-bucket"),
+							Key:    aws.String("thumbnail-" + part.FileName()),
+							Body:   tmpFile,
+						})
+						if err != nil {
+							os.Remove(path)
+							os.Remove(thumbnailPath)
+							println("Error occur to upload data to s3")
+							panic(err)
+						}
 						os.Remove(path)
+						os.Remove(thumbnailPath)
 						photoArray[index].Image = result.Location
+						photoArray[index].Thumbnail = thumbResult.Location
 					}
 				}
 
@@ -190,6 +224,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 				} else {
 					update = bson.M{
 						"$set": bson.M{"Image": photoArray[index].Image,
+							"Thumbnail":   photoArray[index].Thumbnail,
 							"CreatedDate": photoArray[index].CreatedDate,
 							"Identifier":  photoArray[index].Identifier,
 							"Name":        photoArray[index].Name},

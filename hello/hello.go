@@ -1,17 +1,29 @@
 package main
 
+
+/*
+#cgo CFLAGS: -I /Users/jinseonkim/go/src/libs/thumbnailer
+#cgo LDFLAGS: -L/Users/jinseonkim/go/src/libs/thumbnailer -lthumbnailer
+#cgo LDFLAGS: -L/usr/local/Cellar/opencv@2/2.4.13.7_7/lib -lopencv_calib3d -lopencv_contrib -lopencv_core -lopencv_features2d -lopencv_flann -lopencv_gpu -lopencv_highgui -lopencv_imgproc -lopencv_legacy -lopencv_ml -lopencv_nonfree -lopencv_objdetect -lopencv_ocl -lopencv_photo -lopencv_stitching -lopencv_superres -lopencv_ts -lopencv_video -lopencv_videostab
+
+#include <stdlib.h>
+#include <imageCompressor.h>
+*/
+import "C"
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/draw"
 	"image/jpeg"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"time"
+	"unsafe"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -174,21 +186,37 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 							panic(err)
 						}
 						// make thumbnail image
-						opt := jpeg.Options{
-							Quality: 80,
-						}
-						// change file to image
 						img, _, err := image.Decode(file)
+						if err != nil {
+							panic(err)
+						}
+						size := img.Bounds().Size()
+						rect := image.Rect(0, 0, size.X, size.Y)
+						rgba := image.NewRGBA(rect)
+						draw.Draw(rgba, rect, img, rect.Min, draw.Src)
+
+						imageData := (*C.char)(unsafe.Pointer(&rgba.Pix[0]))
+						width := C.int(size.X)
+						height := C.int(size.Y)
+
+						var compressedData *C.char
+						compressedData = C.compressedImage(imageData, width, height)
+
+						cSize := width * height * 4
+						gSlice := (*[1 << 30]uint8)(unsafe.Pointer(compressedData))[:cSize:cSize]
+						nImg := image.NewRGBA(rect)
+						copy(nImg.Pix, gSlice)
+
 						// change image to compressed jpeg
 						thumbnailPath := "/home/ec2-user/go/cloud/storage/thumbanil-" + part.FileName()
 						thumbnailFile, err := os.Create(thumbnailPath)
-						err = jpeg.Encode(thumbnailFile, img, &opt)
-
+						err = jpeg.Encode(thumbnailFile, nImg, nil)
 						if err != nil {
 							println("Error occur to write image file to jpeg")
 							panic(err)
 						}
 						thumbnailFile.Close()
+
 						tmpFile, err := os.Open(thumbnailPath)
 						defer tmpFile.Close()
 						if err != nil {
